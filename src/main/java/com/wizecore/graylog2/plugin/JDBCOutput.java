@@ -69,17 +69,12 @@ public class JDBCOutput implements MessageOutput {
      * Driver to try. If set and driver creation fails no logs will be sent.
      */
     private String driver;
-    
+
     /**
      * Don`t attempt anything.
      */
-    private boolean driverFailed = false;
-    
-    /**
-     * {@link #stop()} was called. Shutdown.
-     */
-    private boolean shutdown;
-    
+    private boolean isRunning = false;
+
     /**
      * Additional fields to specify in main insert query.
      */
@@ -96,8 +91,6 @@ public class JDBCOutput implements MessageOutput {
     private String logInsertAttributeQuery = DEFAULT_LOG_ATTR_QUERY; 
     
     private Connection connection;
-	private PreparedStatement logInsert;
-	private PreparedStatement logInsertAttribute;
     
     @Inject 
     public JDBCOutput(@Assisted Stream stream, @Assisted Configuration conf) throws SQLException {
@@ -116,77 +109,47 @@ public class JDBCOutput implements MessageOutput {
     	}
     	logInsertQuery = conf.getString("logInsertQuery");
     	logInsertAttributeQuery = conf.getString("logInsertAttributeQuery");
-    	
-    	log.info("Creating JDBC output " + url);
-    	
+
+		log.info("Creating JDBC output " + url);
+    	isRunning = true;
+
     	if (driver != null && !driver.trim().isEmpty()) {
     		try {
     			Class.forName(driver);
     		} catch (Exception e) {
     			log.log(Level.SEVERE, "Failed to find/register driver (" + driver + "): " + e.getMessage(), e);
-    			driverFailed = true;
+    			isRunning = false;
     		}
     	}
-    	
-    	reconnect();
     }
 
-	private void reconnect() throws SQLException {
-		if (driverFailed) {
-			return;
-		}
-		
+    private void resetConnection() {
+    	connection = null;
+	}
+
+	private Connection getConnection() throws SQLException {
 		if (connection != null) {
-			try {
-				connection.close();
-			} catch (SQLException e) {
-				log.log(Level.WARNING, e.getMessage(), e);
-			}
+		    return connection;
 		}
-		
-		logInsert = null;
-		logInsertAttribute = null;
-		connection = username != null && !username.trim().isEmpty() ? 
+
+		connection = username != null && !username.trim().isEmpty() ?
     			DriverManager.getConnection(url, username.trim(), password != null ? password.trim() : null) :
     			DriverManager.getConnection(url);
-    			
-    	logInsert = connection.prepareStatement(logInsertQuery, Statement.RETURN_GENERATED_KEYS);
-    	
-    	if (logInsertAttributeQuery != null && !logInsertAttributeQuery.trim().equals("")) {
-    		logInsertAttribute = connection.prepareStatement(logInsertAttributeQuery);
-    	}
-    	
+		log.info("Connected to " + url);
+
     	// Disable autocommit
 	    connection.setAutoCommit(false);
+
+    	return connection;
 	}
     
     @Override
     public boolean isRunning() {
-    	return connection != null;
+    	return isRunning;
     }
     
     @Override
     public void stop() {
-    	shutdown = true;
-    	
-    	if (logInsertAttribute != null) {
-    		try {
-				logInsertAttribute.close();
-    		} catch (SQLException e) {
-				log.log(Level.WARNING, e.getMessage(), e);
-			}
-    		logInsert = null;
-    	}
-    	
-    	if (logInsert != null) {
-    		try {
-				logInsert.close();
-    		} catch (SQLException e) {
-				log.log(Level.WARNING, e.getMessage(), e);
-			}
-    		logInsert = null;
-    	}
-    	
         if (connection != null) {
         	try {
 				connection.close();
@@ -195,6 +158,7 @@ public class JDBCOutput implements MessageOutput {
 			}
         	connection = null;
         }
+    	isRunning = false;
     }
     
     @Override
@@ -206,20 +170,17 @@ public class JDBCOutput implements MessageOutput {
     
     @Override
     public void write(Message msg) throws Exception {
-    	if (shutdown || driverFailed) {
-    		return;
-    	}
-    	    
+
+        Connection conn = getConnection();
+
     	try {
-    		if (connection == null) {
-    			reconnect();
-    		}
-    		
-    		if (connection == null) {
-    			return;
-    		}
-    		    		
-    		synchronized (connection) {
+            PreparedStatement logInsert = conn.prepareStatement(logInsertQuery, Statement.RETURN_GENERATED_KEYS);
+            PreparedStatement logInsertAttribute = null;
+            if (logInsertAttributeQuery != null && !logInsertAttributeQuery.trim().equals("")) {
+                logInsertAttribute = conn.prepareStatement(logInsertAttributeQuery);
+            }
+
+    		synchronized (conn) {
         		int field_index = 1;
         		logInsert.setTimestamp(field_index++, new Timestamp(msg.getTimestamp().getMillis()));
         		logInsert.setString(field_index++, msg.getId());
@@ -276,19 +237,14 @@ public class JDBCOutput implements MessageOutput {
     		}
     	} catch (SQLException e) {
     		log.log(Level.WARNING, "JDBC output error: " + e.getMessage(), e);
-    		if (connection != null) {
-                try {
-                    connection.rollback();
-                    connection.setAutoCommit(true);
-                } catch (SQLException ee) {
-                    // Don`t care
-                }
-    		}
-    		connection = null;
+			try {
+				conn.rollback();
+			} catch (SQLException ee) {
+				log.log(Level.WARNING, "JDBC output error during rollback: " + ee.getMessage(), ee);
+			}
+    		resetConnection();
     	} finally {
-            if (connection != null) {
-                connection.commit();
-            }
+            conn.commit();
         }
     }
             
