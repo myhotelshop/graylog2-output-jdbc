@@ -162,7 +162,7 @@ public class JDBCOutput implements MessageOutput {
     
     @Override
     public boolean isRunning() {
-    	return connection != null;
+    	return !shutdown && !driverFailed;
     }
     
     @Override
